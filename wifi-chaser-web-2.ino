@@ -11,7 +11,7 @@ const int output3 = 27;
 const int output4 = 26;
 
 WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
+WebSocketsServer webSocket = WebSocketsServer(81); 
 
 int currentAnimation = -1;
 int selectedAnimation = 0;
@@ -20,6 +20,10 @@ int animationSpeed = 500;
 unsigned long lastUpdate = 0;
 int animationStep = 0;
 int chaserPosition = 0;
+
+unsigned long lastAutoSwitch = 0;
+const unsigned long AUTO_SWITCH_INTERVAL = 10000;
+int autoModeCurrentAnimation = 0;
 
 uint8_t ledStates[4] = {HIGH, HIGH, HIGH, HIGH};
 
@@ -252,6 +256,14 @@ const char index_html[] PROGMEM = R"rawliteral(
       font-size: 15px;
       font-weight: 600;
       color: #667eea;
+      min-height: 20px;
+    }
+    
+    .auto-indicator {
+      font-size: 11px;
+      color: #10b981;
+      font-weight: 500;
+      margin-top: 4px;
     }
     
     .led-visual {
@@ -532,11 +544,13 @@ const char index_html[] PROGMEM = R"rawliteral(
           <option value="13">🚗 Knight Rider</option>
           <option value="14">⚠️ Strobe</option>
           <option value="15">🌈 Cascade</option>
+          <option value="16">🎬 Auto Cycle All</option>
         </select>
       </div>
       
       <div class="animation-preview">
         <div class="preview-title" id="preview-title">All ON</div>
+        <div class="auto-indicator" id="auto-indicator" style="display: none;">▶ Currently: <span id="current-auto-anim"></span></div>
         <div class="led-visual">
           <div class="led-dot" id="led1"></div>
           <div class="led-dot" id="led2"></div>
@@ -587,6 +601,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     const speedValue = document.getElementById('speed-value');
     const previewTitle = document.getElementById('preview-title');
     const toggleControl = document.getElementById('toggle-control');
+    const autoIndicator = document.getElementById('auto-indicator');
+    const currentAutoAnim = document.getElementById('current-auto-anim');
     const ledDots = [
       document.getElementById('led1'),
       document.getElementById('led2'),
@@ -599,7 +615,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       '3': 'Bounce', '4': 'All Blink', '5': 'Pairs Alternating', '6': 'Wave',
       '7': 'Theater Chase', '8': 'Split', '9': 'Double Chase', '10': 'Random',
       '11': 'Binary Counter', '12': 'Pulse Breathing', '13': 'Knight Rider',
-      '14': 'Strobe', '15': 'Cascade'
+      '14': 'Strobe', '15': 'Cascade', '16': 'Auto Cycle All'
     };
     
     function updateConnectionStatus(connected) {
@@ -684,9 +700,16 @@ const char index_html[] PROGMEM = R"rawliteral(
       if (previewInterval) clearInterval(previewInterval);
       
       let step = 0;
+      let autoStep = 0;
       const speedLevel = parseInt(speedSlider.value);
       const animSpeed = 1100 - (speedLevel * 100);
       const finalSpeed = animSpeed < 50 ? 50 : animSpeed;
+      
+      if (mode === '16') {
+        autoIndicator.style.display = 'block';
+      } else {
+        autoIndicator.style.display = 'none';
+      }
       
       const animations = {
         '-1': () => updateLEDPreview([0, 0, 0, 0]),
@@ -766,8 +789,18 @@ const char index_html[] PROGMEM = R"rawliteral(
           step++;
         },
         '12': () => {
-          const pulsePattern = [1,1,1,1,0,0,0,0,0,0,1,1,1,1,1,1];
-          const on = pulsePattern[step % 16];
+          const breathePattern = [
+            0,0,0,0,
+            1,0,0,0,
+            1,0,1,0,
+            1,1,1,0,
+            1,1,1,1,
+            1,1,1,0,
+            1,0,1,0,
+            1,0,0,0 
+          ];
+          const idx = (step % 8) * 4;
+          const on = breathePattern[idx + (step % 4)];
           updateLEDPreview([on, on, on, on]);
           step++;
         },
@@ -778,7 +811,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           step++;
         },
         '14': () => {
-          const on = step % 4 < 2;
+          const on = step % 4 < 1;
           updateLEDPreview([on, on, on, on]);
           step++;
         },
@@ -789,6 +822,21 @@ const char index_html[] PROGMEM = R"rawliteral(
           ];
           updateLEDPreview(patterns[step % 8]);
           step++;
+        },
+        '16': () => {
+          const cycleTime = 10000;
+          const currentAnim = Math.floor((Date.now() % (cycleTime * 15)) / cycleTime) + 1;
+          const animKey = currentAnim.toString();
+          
+          currentAutoAnim.textContent = animationNames[animKey];
+          const localStep = Math.floor((Date.now() % cycleTime) / finalSpeed);
+          
+          if (animations[animKey]) {
+            const tempStep = step;
+            step = localStep;
+            animations[animKey]();
+            step = tempStep + 1;
+          }
         }
       };
       
@@ -858,6 +906,10 @@ const char index_html[] PROGMEM = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+
+void setLED(int index, uint8_t state);
+void setAllLEDs(uint8_t s1, uint8_t s2, uint8_t s3, uint8_t s4);
+void runSingleAnimation(int animationIndex);
 
 void setLED(int index, uint8_t state) {
   if (ledStates[index] != state) {
@@ -940,19 +992,23 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       }
       else if (message.startsWith("select")) {
         int aniNum = message.substring(6).toInt();
-        if (aniNum >= 0 && aniNum <= 15) {
+        if (aniNum >= 0 && aniNum <= 16) {
           selectedAnimation = aniNum;
           stateChanged = true;
         }
       }
       else if (message.startsWith("ani")) {
         int aniNum = message.substring(3).toInt();
-        if (aniNum >= 0 && aniNum <= 15) {
+        if (aniNum >= 0 && aniNum <= 16) {
           selectedAnimation = aniNum;
           if (isPowerOn) {
             currentAnimation = aniNum;
             animationStep = 0;
             chaserPosition = 0;
+            if (aniNum == 16) {
+              autoModeCurrentAnimation = 1; 
+              lastAutoSwitch = millis();
+            }
           }
           stateChanged = true;
         }
@@ -977,11 +1033,33 @@ void runAnimation() {
   }
   
   unsigned long currentMillis = millis();
+
+  if (currentAnimation == 16) {
+    if (currentMillis - lastAutoSwitch >= AUTO_SWITCH_INTERVAL) {
+      lastAutoSwitch = currentMillis;
+      autoModeCurrentAnimation++;
+      if (autoModeCurrentAnimation > 15) {
+        autoModeCurrentAnimation = 1;
+      }
+      animationStep = 0;
+      chaserPosition = 0;
+    }
+    
+    if (currentMillis - lastUpdate >= animationSpeed) {
+      lastUpdate = currentMillis;
+      runSingleAnimation(autoModeCurrentAnimation);
+    }
+    return;
+  }
   
   if (currentMillis - lastUpdate >= animationSpeed) {
     lastUpdate = currentMillis;
-    
-    switch(currentAnimation) {
+    runSingleAnimation(currentAnimation);
+  }
+}
+
+void runSingleAnimation(int animationIndex) {
+  switch(animationIndex) {
       case 0:
         setAllLEDs(LOW, LOW, LOW, LOW);
         break;
@@ -1038,10 +1116,10 @@ void runAnimation() {
         int wavePattern[] = {1,1,1,1, 1,1,1,0, 1,1,0,0, 1,0,0,0, 
                              0,0,0,0, 0,0,0,1, 0,0,1,1, 0,1,1,1};
         int idx = (animationStep % 8) * 4;
-        setLED(0, wavePattern[idx] ? HIGH : LOW);
-        setLED(1, wavePattern[idx+1] ? HIGH : LOW);
-        setLED(2, wavePattern[idx+2] ? HIGH : LOW);
-        setLED(3, wavePattern[idx+3] ? HIGH : LOW);
+        setLED(0, wavePattern[idx] ? LOW : HIGH);
+        setLED(1, wavePattern[idx+1] ? LOW : HIGH);
+        setLED(2, wavePattern[idx+2] ? LOW : HIGH);
+        setLED(3, wavePattern[idx+3] ? LOW : HIGH);
         animationStep++;
         if (animationStep > 1000) animationStep = 0;
         break;
@@ -1071,11 +1149,10 @@ void runAnimation() {
         
       case 9: {
         bool led1 = (chaserPosition == 0 || chaserPosition == 2);
-        bool led4 = (chaserPosition == 0 || chaserPosition == 2);
         setLED(0, led1 ? LOW : HIGH);
         setLED(1, !led1 ? LOW : HIGH);
-        setLED(2, !led4 ? LOW : HIGH);
-        setLED(3, led4 ? LOW : HIGH);
+        setLED(2, !led1 ? LOW : HIGH);
+        setLED(3, led1 ? LOW : HIGH);
         chaserPosition = (chaserPosition + 1) % 4;
         break;
       }
@@ -1099,9 +1176,19 @@ void runAnimation() {
       }
         
       case 12: {
-        int pulsePattern[] = {1,1,1,1,0,0,0,0,0,0,1,1,1,1,1,1};
-        int idx = animationStep % 16;
-        if (pulsePattern[idx]) {
+        int breathePattern[] = {
+          0,0,0,0,
+          1,0,0,0,
+          1,0,1,0,
+          1,1,1,0,
+          1,1,1,1,
+          1,1,1,0,
+          1,0,1,0,
+          1,0,0,0
+        };
+        int idx = (animationStep % 8) * 4;
+        bool state = breathePattern[idx + (animationStep % 4)];
+        if (state) {
           setAllLEDs(LOW, LOW, LOW, LOW);
         } else {
           setAllLEDs(HIGH, HIGH, HIGH, HIGH);
@@ -1124,7 +1211,7 @@ void runAnimation() {
       }
         
       case 14:
-        if (animationStep % 4 < 2) {
+        if (animationStep % 4 < 1) {
           setAllLEDs(LOW, LOW, LOW, LOW);
         } else {
           setAllLEDs(HIGH, HIGH, HIGH, HIGH);
@@ -1143,7 +1230,6 @@ void runAnimation() {
         animationStep++;
         if (animationStep > 1000) animationStep = 0;
         break;
-      }
     }
   }
 }
@@ -1220,5 +1306,4 @@ void loop() {
   server.handleClient();
   runAnimation();
   broadcastState();
-
 }
